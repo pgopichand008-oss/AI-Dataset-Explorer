@@ -73,3 +73,43 @@ def compare_datasets(old_df, new_df):
         "type_changes": type_changes,
         "possible_renames": possible_renames
     }
+
+def compare_statistics(old_df, new_df):
+    """
+    Compare basic statistics for common numerical columns.
+    """
+
+    results = []
+
+    common_columns = set(old_df.columns).intersection(new_df.columns)
+
+    for column in sorted(common_columns):
+
+        if not (
+            pd.api.types.is_numeric_dtype(old_df[column])
+            and pd.api.types.is_numeric_dtype(new_df[column])
+        ):
+            continue
+
+        old_mean = old_df[column].mean()
+        new_mean = new_df[column].mean()
+
+        old_median = old_df[column].median()
+        new_median = new_df[column].median()
+
+        old_std = old_df[column].std()
+        new_std = new_df[column].std()
+
+        results.append({
+            "column": column,
+            "old_mean": round(old_mean, 2),
+            "new_mean": round(new_mean, 2),
+            "mean_change": round(new_mean - old_mean, 2),
+            "old_median": round(old_median, 2),
+            "new_median": round(new_median, 2),
+            "median_change": round(new_median - old_median, 2),
+            "old_std": round(old_std, 2),
+            "new_std": round(new_std, 2)
+        })
+
+    return results
