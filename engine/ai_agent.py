@@ -75,12 +75,56 @@ def assess_impact(changes, quality, statistics=None):
 
     # Data type changes
     if changes.get("type_changes"):
+        high_conflicts = [
+            change
+            for change in changes["type_changes"]
+            if change.get("conflict_level") == "HIGH"
+        ]
+
+        low_changes = [
+            change
+            for change in changes["type_changes"]
+            if change.get("conflict_level") == "LOW"
+        ]
+
+        if high_conflicts:
+            impacts.append({
+                "area": "DATA TYPE",
+                "severity": "HIGH",
+                "message": (
+                    f"{len(high_conflicts)} high-severity "
+                    f"data type conflict(s) detected."
+                )
+            })
+
+        if low_changes:
+            impacts.append({
+                "area": "DATA TYPE",
+                "severity": "LOW",
+                "message": (
+                    f"{len(low_changes)} low-severity "
+                    f"data type change(s) detected."
+                )
+            })
+
+    # Invalid values
+    invalid_columns = []
+
+    for column, summary in changes.get(
+        "invalid_values",
+        {}
+    ).items():
+
+        if summary.get("invalid_count", 0) > 0:
+            invalid_columns.append(column)
+
+    if invalid_columns:
         impacts.append({
-            "area": "DATA TYPE",
-            "severity": "HIGH",
+            "area": "DATA QUALITY",
+            "severity": "MEDIUM",
             "message": (
-                f"{len(changes['type_changes'])} column data type "
-                f"change(s) detected."
+                f"Invalid values detected in "
+                f"{len(invalid_columns)} column(s)."
             )
         })
 
@@ -129,10 +173,22 @@ def assess_impact(changes, quality, statistics=None):
                 continue
 
             mean_change_percent = abs(
-                stat["mean_change"] / stat["old_mean"] * 100
+                stat["mean_change"]
+                / stat["old_mean"]
+                * 100
             )
 
-            if mean_change_percent >= 10:
+            if mean_change_percent >= 20:
+                impacts.append({
+                    "area": "STATISTICAL",
+                    "severity": "HIGH",
+                    "message": (
+                        f"'{stat['column']}' mean changed by "
+                        f"{round(mean_change_percent, 1)}%."
+                    )
+                })
+
+            elif mean_change_percent >= 10:
                 impacts.append({
                     "area": "STATISTICAL",
                     "severity": "MEDIUM",
@@ -159,10 +215,36 @@ def assess_ml_readiness(changes, quality, statistics=None):
         )
 
     # Data type changes
-    if changes.get("type_changes"):
-        issues.append(
-            "Data-type changes may require preprocessing before ML analysis."
+    for change in changes.get("type_changes", []):
+
+        if change.get("conflict_level") == "HIGH":
+            issues.append(
+                f"High-severity data-type conflict detected in "
+                f"'{change['column']}'; preprocessing or correction "
+                f"may be required before ML analysis."
+            )
+
+        elif change.get("conflict_level") == "LOW":
+            issues.append(
+                f"Low-severity data-type change detected in "
+                f"'{change['column']}'; preprocessing may be required."
+            )
+
+    # Invalid values
+    for column, summary in changes.get(
+        "invalid_values",
+        {}
+    ).items():
+
+        invalid_count = summary.get(
+            "invalid_count",
+            0
         )
+
+        if invalid_count > 0:
+            issues.append(
+                f"Invalid values detected in '{column}'."
+            )
 
     # Missing values
     for change in quality.get("missing_changes", []):
@@ -189,7 +271,9 @@ def assess_ml_readiness(changes, quality, statistics=None):
                 continue
 
             change_percent = abs(
-                stat["mean_change"] / stat["old_mean"] * 100
+                stat["mean_change"]
+                / stat["old_mean"]
+                * 100
             )
 
             if change_percent >= 20:
@@ -238,6 +322,18 @@ def identify_limitations(changes, quality, statistics=None):
             "machine-learning analysis."
         )
 
+    # Invalid values
+    for column, summary in changes.get(
+        "invalid_values",
+        {}
+    ).items():
+
+        if summary.get("invalid_count", 0) > 0:
+            limitations.append(
+                f"Invalid values were detected in '{column}'; "
+                f"valid values can still be used where appropriate."
+            )
+
     # Missing values
     for change in quality.get("missing_changes", []):
         if change["change"] > 0:
@@ -263,7 +359,9 @@ def identify_limitations(changes, quality, statistics=None):
                 continue
 
             change_percent = abs(
-                stat["mean_change"] / stat["old_mean"] * 100
+                stat["mean_change"]
+                / stat["old_mean"]
+                * 100
             )
 
             if change_percent >= 10:
@@ -281,53 +379,144 @@ def generate_recommendation(changes, quality):
     """
 
     # Critical data-type problems
-    if changes.get("type_changes"):
-        return "NOT SUITABLE WITHOUT ADDITIONAL CORRECTION"
+    for type_change in changes.get(
+        "type_changes",
+        []
+    ):
+
+        if type_change.get(
+            "conflict_level"
+        ) == "HIGH":
+
+            return (
+                "NOT SUITABLE WITHOUT "
+                "ADDITIONAL CORRECTION"
+            )
+
+    # Invalid values require attention, but do not automatically
+    # make the dataset unsuitable when valid values remain usable.
+    for column, summary in changes.get(
+        "invalid_values",
+        {}
+    ).items():
+
+        invalid_count = summary.get(
+            "invalid_count",
+            0
+        )
+
+        valid_count = summary.get(
+            "valid_count",
+            0
+        )
+
+        # Some valid values remain, so the dataset can still be
+        # analyzed after addressing the invalid entries.
+        if (
+            invalid_count > 0
+            and valid_count > 0
+        ):
+
+            return (
+                "NEEDS ATTENTION BEFORE "
+                "ANALYSIS"
+            )
+
+        # No valid values remain in the affected column.
+        if (
+            invalid_count > 0
+            and valid_count == 0
+        ):
+
+            return (
+                "NOT SUITABLE WITHOUT "
+                "ADDITIONAL CORRECTION"
+            )
 
     # Determine whether removed columns are actually possible renames
     possible_rename_old = {
         item["old_column"]
-        for item in changes.get("possible_renames", [])
+        for item in changes.get(
+            "possible_renames",
+            []
+        )
     }
 
     truly_removed = [
         column
-        for column in changes.get("removed_columns", [])
+        for column in changes.get(
+            "removed_columns",
+            []
+        )
         if column not in possible_rename_old
     ]
 
     # Genuine removed columns require attention
     if truly_removed:
-        return "NEEDS ATTENTION BEFORE ANALYSIS"
+        return (
+            "NEEDS ATTENTION BEFORE "
+            "ANALYSIS"
+        )
 
     # Significant missing-value increase
-    for change in quality.get("missing_changes", []):
+    for change in quality.get(
+        "missing_changes",
+        []
+    ):
+
         if change["change"] >= 20:
-            return "NEEDS ATTENTION BEFORE ANALYSIS"
+            return (
+                "NEEDS ATTENTION BEFORE "
+                "ANALYSIS"
+            )
 
     # Increased duplicates
-    if quality.get("duplicate_change", 0) > 0:
-        return "NEEDS ATTENTION BEFORE ANALYSIS"
+    if quality.get(
+        "duplicate_change",
+        0
+    ) > 0:
+
+        return (
+            "NEEDS ATTENTION BEFORE "
+            "ANALYSIS"
+        )
 
     return "READY FOR FURTHER ANALYSIS"
 
 
-def run_intelligence_analysis(old_df, new_df, previous_finding=""):
+def run_intelligence_analysis(
+    old_df,
+    new_df,
+    previous_finding=""
+):
     """
     Run the complete dataset intelligence workflow.
     """
 
-    from change_engine import compare_datasets, compare_statistics
+    from change_engine import (
+        compare_datasets,
+        compare_statistics
+    )
+
     from quality_engine import compare_quality
 
     # 1. Detect changes
-    changes = compare_datasets(old_df, new_df)
+    changes = compare_datasets(
+        old_df,
+        new_df
+    )
 
     # 2. Analyze statistics
-    statistics = compare_statistics(old_df, new_df)
+    statistics = compare_statistics(
+        old_df,
+        new_df
+    )
 
     # 3. Compare data quality
-    quality = compare_quality(old_df, new_df)
+    quality = compare_quality(
+        old_df,
+        new_df
+    )
 
     # 4. Assess impact
     impact = assess_impact(
@@ -352,12 +541,17 @@ def run_intelligence_analysis(old_df, new_df, previous_finding=""):
 
     # 7. Reconsider previous findings
     if previous_finding:
-        reconsideration = reconsider_previous_finding(
-            previous_finding,
-            changes,
-            quality
+
+        reconsideration = (
+            reconsider_previous_finding(
+                previous_finding,
+                changes,
+                quality
+            )
         )
+
     else:
+
         reconsideration = {
             "status": "NO_PREVIOUS_FINDING",
             "warnings": []
