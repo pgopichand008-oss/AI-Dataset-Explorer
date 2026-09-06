@@ -1,1 +1,3 @@
 __pycache__/
+*.pyc
+app_backup_before_restore.py
