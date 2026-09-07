@@ -1,139 +1,276 @@
+"""
+Dataset Intelligence Agent
+
+Coordinates dataset comparison, quality analysis, statistical analysis,
+impact assessment, ML-readiness assessment, previous-finding reconsideration,
+and final recommendation generation.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+READY = "READY FOR FURTHER ANALYSIS"
+ATTENTION = "NEEDS ATTENTION BEFORE ANALYSIS"
+UNSUITABLE = "NOT SUITABLE WITHOUT ADDITIONAL CORRECTION"
+
+RECONSIDER = "RECONSIDER"
+STILL_VALID = "STILL_VALID"
+NO_PREVIOUS_FINDING = "NO_PREVIOUS_FINDING"
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _contains_column(text, column):
+    """Return True when a column name is mentioned in a finding."""
+    if not text or not column:
+        return False
+
+    return column.lower() in text.lower()
+
+
+def _is_identifier(column):
+    """
+    Determine whether a column looks like an identifier.
+
+    Identifier-like columns are excluded from statistical impact checks
+    because percentage changes in IDs are usually not meaningful.
+    """
+    name = str(column).strip().lower()
+
+    return (
+        name == "id"
+        or name.endswith("_id")
+        or name.endswith("id")
+    )
+
+
+def _safe_percentage_change(old_value, change):
+    """Calculate percentage change safely."""
+    if old_value in (None, 0):
+        return None
+
+    try:
+        return abs(float(change) / float(old_value) * 100)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _type_changes_by_severity(changes, severity):
+    """Return type changes matching a requested conflict severity."""
+    return [
+        change
+        for change in changes.get("type_changes", [])
+        if change.get("conflict_level") == severity
+    ]
+
+
+def _invalid_value_entries(changes):
+    """Return columns containing invalid values."""
+    invalid_values = changes.get("invalid_values", {})
+
+    return [
+        (column, summary)
+        for column, summary in invalid_values.items()
+        if summary.get("invalid_count", 0) > 0
+    ]
+
+
+def _increased_missing_values(quality):
+    """Return columns where missing-value rate increased."""
+    return [
+        item
+        for item in quality.get("missing_changes", [])
+        if item.get("change", 0) > 0
+    ]
+
+
+def _significant_missing_values(quality, threshold=20):
+    """Return columns with missing-value increases at or above a threshold."""
+    return [
+        item
+        for item in quality.get("missing_changes", [])
+        if item.get("change", 0) >= threshold
+    ]
+
+
+def _statistical_shifts(statistics, threshold=10):
+    """
+    Return meaningful statistical shifts.
+
+    Mean percentage change is used as the primary signal while the
+    underlying statistics still contain mean, median, std, min and max.
+    """
+    shifts = []
+
+    for stat in statistics or []:
+        column = stat.get("column")
+
+        if _is_identifier(column):
+            continue
+
+        percent_change = _safe_percentage_change(
+            stat.get("old_mean"),
+            stat.get("mean_change")
+        )
+
+        if percent_change is not None and percent_change >= threshold:
+            shifts.append({
+                "column": column,
+                "percentage_change": percent_change,
+                "statistics": stat
+            })
+
+    return shifts
+
+
+# ---------------------------------------------------------------------------
+# Previous finding reconsideration
+# ---------------------------------------------------------------------------
+
 def reconsider_previous_finding(finding, changes, quality):
     """
-    Check whether a previous analysis finding is still valid
-    after the dataset has been updated.
-    """
+    Check whether a previous analysis finding remains valid.
 
-    finding_text = finding.lower()
+    A finding is reconsidered when it refers to a column affected by:
+    - removal
+    - type changes
+    - invalid values
+    - increased missing values
+    """
+    finding_text = str(finding or "").lower()
     warnings = []
+
+    if not finding_text:
+        return {
+            "status": NO_PREVIOUS_FINDING,
+            "warnings": []
+        }
 
     # Removed columns
     for column in changes.get("removed_columns", []):
-        if column.lower() in finding_text:
+        if _contains_column(finding_text, column):
             warnings.append(
                 f"'{column}' was removed from the updated dataset."
             )
 
-    # Data type changes
+    # Type changes
     for change in changes.get("type_changes", []):
-        column = change["column"]
+        column = change.get("column")
 
-        if column.lower() in finding_text:
+        if _contains_column(finding_text, column):
             warnings.append(
                 f"'{column}' changed type from "
-                f"{change['old_type']} to {change['new_type']}."
+                f"{change.get('old_type')} to {change.get('new_type')}."
             )
 
-    # Increased missing values
-    for change in quality.get("missing_changes", []):
-        column = change["column"]
+    # Invalid values
+    for column, summary in _invalid_value_entries(changes):
+        if _contains_column(finding_text, column):
+            invalid_count = summary.get("invalid_count", 0)
 
-        if column.lower() in finding_text and change["change"] > 0:
+            warnings.append(
+                f"'{column}' contains {invalid_count} invalid value(s) "
+                "in the updated dataset."
+            )
+
+    # Missing values
+    for change in _increased_missing_values(quality):
+        column = change.get("column")
+
+        if _contains_column(finding_text, column):
             warnings.append(
                 f"Missing values in '{column}' increased by "
-                f"{change['change']} percentage points."
+                f"{change.get('change', 0)} percentage points."
             )
 
     if warnings:
         return {
-            "status": "RECONSIDER",
+            "status": RECONSIDER,
             "warnings": warnings
         }
 
     return {
-        "status": "STILL_VALID",
+        "status": STILL_VALID,
         "warnings": []
     }
 
 
+# ---------------------------------------------------------------------------
+# Impact assessment
+# ---------------------------------------------------------------------------
+
 def assess_impact(changes, quality, statistics=None):
     """
-    Assess how significant the dataset changes are.
+    Assess structural, quality, type, duplicate, and statistical impact.
     """
-
     impacts = []
 
-    # Added columns
-    if changes.get("added_columns"):
+    # Structural changes
+    added = changes.get("added_columns", [])
+    removed = changes.get("removed_columns", [])
+
+    if added:
         impacts.append({
             "area": "STRUCTURAL",
             "severity": "MEDIUM",
-            "message": (
-                f"{len(changes['added_columns'])} column(s) were added."
-            )
+            "message": f"{len(added)} column(s) were added."
         })
 
-    # Removed columns
-    if changes.get("removed_columns"):
+    if removed:
         impacts.append({
             "area": "STRUCTURAL",
             "severity": "HIGH",
+            "message": f"{len(removed)} column(s) were removed."
+        })
+
+    # Type changes
+    high_type_changes = _type_changes_by_severity(changes, "HIGH")
+    low_type_changes = _type_changes_by_severity(changes, "LOW")
+
+    if high_type_changes:
+        impacts.append({
+            "area": "DATA TYPE",
+            "severity": "HIGH",
             "message": (
-                f"{len(changes['removed_columns'])} column(s) were removed."
+                f"{len(high_type_changes)} high-severity "
+                "data-type change(s) detected."
             )
         })
 
-    # Data type changes
-    if changes.get("type_changes"):
-        high_conflicts = [
-            change
-            for change in changes["type_changes"]
-            if change.get("conflict_level") == "HIGH"
-        ]
-
-        low_changes = [
-            change
-            for change in changes["type_changes"]
-            if change.get("conflict_level") == "LOW"
-        ]
-
-        if high_conflicts:
-            impacts.append({
-                "area": "DATA TYPE",
-                "severity": "HIGH",
-                "message": (
-                    f"{len(high_conflicts)} high-severity "
-                    f"data type conflict(s) detected."
-                )
-            })
-
-        if low_changes:
-            impacts.append({
-                "area": "DATA TYPE",
-                "severity": "LOW",
-                "message": (
-                    f"{len(low_changes)} low-severity "
-                    f"data type change(s) detected."
-                )
-            })
+    if low_type_changes:
+        impacts.append({
+            "area": "DATA TYPE",
+            "severity": "LOW",
+            "message": (
+                f"{len(low_type_changes)} low-severity "
+                "data-type change(s) detected."
+            )
+        })
 
     # Invalid values
-    invalid_columns = []
+    invalid_entries = _invalid_value_entries(changes)
 
-    for column, summary in changes.get(
-        "invalid_values",
-        {}
-    ).items():
+    if invalid_entries:
+        invalid_count = sum(
+            summary.get("invalid_count", 0)
+            for _, summary in invalid_entries
+        )
 
-        if summary.get("invalid_count", 0) > 0:
-            invalid_columns.append(column)
-
-    if invalid_columns:
         impacts.append({
             "area": "DATA QUALITY",
             "severity": "MEDIUM",
             "message": (
-                f"Invalid values detected in "
-                f"{len(invalid_columns)} column(s)."
+                f"{invalid_count} invalid value(s) detected "
+                "in the updated dataset."
             )
         })
 
     # Missing values
-    increased_missing = [
-        item
-        for item in quality.get("missing_changes", [])
-        if item["change"] > 0
-    ]
+    increased_missing = _increased_missing_values(quality)
 
     if increased_missing:
         impacts.append({
@@ -146,141 +283,86 @@ def assess_impact(changes, quality, statistics=None):
         })
 
     # Duplicate rows
-    if quality.get("duplicate_change", 0) > 0:
+    duplicate_change = quality.get("duplicate_change", 0)
+
+    if duplicate_change > 0:
         impacts.append({
             "area": "DUPLICATES",
             "severity": "MEDIUM",
-            "message": (
-                "Duplicate rows increased in the updated dataset."
-            )
+            "message": "Duplicate rows increased in the updated dataset."
         })
 
     # Statistical changes
-    if statistics:
-        for stat in statistics:
+    for shift in _statistical_shifts(statistics, threshold=10):
+        severity = (
+            "HIGH"
+            if shift["percentage_change"] >= 20
+            else "MEDIUM"
+        )
 
-            column_name = stat["column"].lower()
-
-            # Ignore identifier-like columns
-            if (
-                column_name == "id"
-                or column_name.endswith("_id")
-                or column_name.endswith("id")
-            ):
-                continue
-
-            if stat["old_mean"] == 0:
-                continue
-
-            mean_change_percent = abs(
-                stat["mean_change"]
-                / stat["old_mean"]
-                * 100
+        impacts.append({
+            "area": "STATISTICAL",
+            "severity": severity,
+            "message": (
+                f"'{shift['column']}' mean changed by "
+                f"{round(shift['percentage_change'], 1)}%."
             )
-
-            if mean_change_percent >= 20:
-                impacts.append({
-                    "area": "STATISTICAL",
-                    "severity": "HIGH",
-                    "message": (
-                        f"'{stat['column']}' mean changed by "
-                        f"{round(mean_change_percent, 1)}%."
-                    )
-                })
-
-            elif mean_change_percent >= 10:
-                impacts.append({
-                    "area": "STATISTICAL",
-                    "severity": "MEDIUM",
-                    "message": (
-                        f"'{stat['column']}' mean changed by "
-                        f"{round(mean_change_percent, 1)}%."
-                    )
-                })
+        })
 
     return impacts
 
 
+# ---------------------------------------------------------------------------
+# ML readiness
+# ---------------------------------------------------------------------------
+
 def assess_ml_readiness(changes, quality, statistics=None):
     """
-    Assess how dataset changes may affect machine-learning readiness.
+    Assess whether dataset changes may affect ML readiness.
     """
-
     issues = []
 
-    # Removed columns
+    # Removed features
     if changes.get("removed_columns"):
         issues.append(
             "Removed columns may affect previously selected ML features."
         )
 
-    # Data type changes
-    for change in changes.get("type_changes", []):
-
-        if change.get("conflict_level") == "HIGH":
-            issues.append(
-                f"High-severity data-type conflict detected in "
-                f"'{change['column']}'; preprocessing or correction "
-                f"may be required before ML analysis."
-            )
-
-        elif change.get("conflict_level") == "LOW":
-            issues.append(
-                f"Low-severity data-type change detected in "
-                f"'{change['column']}'; preprocessing may be required."
-            )
-
-    # Invalid values
-    for column, summary in changes.get(
-        "invalid_values",
-        {}
-    ).items():
-
-        invalid_count = summary.get(
-            "invalid_count",
-            0
+    # High-severity type conflicts
+    if _type_changes_by_severity(changes, "HIGH"):
+        issues.append(
+            "High-severity data-type conflicts may prevent reliable "
+            "machine-learning preprocessing."
         )
 
-        if invalid_count > 0:
-            issues.append(
-                f"Invalid values detected in '{column}'."
-            )
+    # Low-severity type conflicts
+    if _type_changes_by_severity(changes, "LOW"):
+        issues.append(
+            "Some data-type changes may require preprocessing "
+            "before ML analysis."
+        )
 
-    # Missing values
-    for change in quality.get("missing_changes", []):
-        if change["change"] >= 10:
-            issues.append(
-                f"Missing values increased in '{change['column']}'."
-            )
+    # Invalid values
+    invalid_entries = _invalid_value_entries(changes)
 
-    # Statistical changes
-    if statistics:
-        for stat in statistics:
+    if invalid_entries:
+        issues.append(
+            "Invalid values were detected and should be handled "
+            "before machine-learning analysis."
+        )
 
-            column_name = stat["column"].lower()
+    # Significant missing values
+    for change in _significant_missing_values(quality, threshold=10):
+        issues.append(
+            f"Missing values increased in '{change.get('column')}'."
+        )
 
-            # Ignore identifier-like columns
-            if (
-                column_name == "id"
-                or column_name.endswith("_id")
-                or column_name.endswith("id")
-            ):
-                continue
-
-            if stat["old_mean"] == 0:
-                continue
-
-            change_percent = abs(
-                stat["mean_change"]
-                / stat["old_mean"]
-                * 100
-            )
-
-            if change_percent >= 20:
-                issues.append(
-                    f"'{stat['column']}' shows a significant "
-                    f"change in its mean."
-                )
+    # Significant statistical shifts
+    for shift in _statistical_shifts(statistics, threshold=20):
+        issues.append(
+            f"'{shift['column']}' shows a significant "
+            "statistical change."
+        )
 
     if not issues:
         return {
@@ -294,11 +376,14 @@ def assess_ml_readiness(changes, quality, statistics=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Limitations
+# ---------------------------------------------------------------------------
+
 def identify_limitations(changes, quality, statistics=None):
     """
-    Identify limitations that should be communicated before analysis.
+    Identify limitations that should be communicated to the user.
     """
-
     limitations = []
 
     # Possible renames
@@ -315,7 +400,7 @@ def identify_limitations(changes, quality, statistics=None):
             "longer apply."
         )
 
-    # Data type changes
+    # Type changes
     if changes.get("type_changes"):
         limitations.append(
             "Changed data types may affect statistical and "
@@ -323,246 +408,157 @@ def identify_limitations(changes, quality, statistics=None):
         )
 
     # Invalid values
-    for column, summary in changes.get(
-        "invalid_values",
-        {}
-    ).items():
-
-        if summary.get("invalid_count", 0) > 0:
-            limitations.append(
-                f"Invalid values were detected in '{column}'; "
-                f"valid values can still be used where appropriate."
-            )
+    if _invalid_value_entries(changes):
+        limitations.append(
+            "Invalid values were detected; affected entries should "
+            "be reviewed before relying on the affected analysis."
+        )
 
     # Missing values
-    for change in quality.get("missing_changes", []):
-        if change["change"] > 0:
-            limitations.append(
-                f"Missing values changed in '{change['column']}'."
-            )
+    for change in _increased_missing_values(quality):
+        limitations.append(
+            f"Missing values changed in '{change.get('column')}'."
+        )
 
-    # Statistical changes
-    if statistics:
-        for stat in statistics:
-
-            column_name = stat["column"].lower()
-
-            # Ignore identifier-like columns
-            if (
-                column_name == "id"
-                or column_name.endswith("_id")
-                or column_name.endswith("id")
-            ):
-                continue
-
-            if stat["old_mean"] == 0:
-                continue
-
-            change_percent = abs(
-                stat["mean_change"]
-                / stat["old_mean"]
-                * 100
-            )
-
-            if change_percent >= 10:
-                limitations.append(
-                    f"'{stat['column']}' shows a notable "
-                    f"statistical shift."
-                )
+    # Statistical shifts
+    for shift in _statistical_shifts(statistics, threshold=10):
+        limitations.append(
+            f"'{shift['column']}' shows a notable "
+            "statistical shift."
+        )
 
     return limitations
 
 
+# ---------------------------------------------------------------------------
+# Final recommendation
+# ---------------------------------------------------------------------------
+
 def generate_recommendation(changes, quality):
     """
     Generate exactly one final recommendation.
+
+    Priority:
+    1. HIGH type conflict
+    2. Completely invalid affected column
+    3. Mixed valid/invalid values
+    4. Genuine removed columns
+    5. Significant missing-value increase
+    6. Increased duplicates
+    7. Ready
     """
 
-    # Critical data-type problems
-    for type_change in changes.get(
-        "type_changes",
-        []
-    ):
+    # 1. HIGH type conflicts
+    if _type_changes_by_severity(changes, "HIGH"):
+        return UNSUITABLE
 
-        if type_change.get(
-            "conflict_level"
-        ) == "HIGH":
+    # 2. Invalid values
+    for _, summary in _invalid_value_entries(changes):
+        invalid_count = summary.get("invalid_count", 0)
+        valid_count = summary.get("valid_count", 0)
 
-            return (
-                "NOT SUITABLE WITHOUT "
-                "ADDITIONAL CORRECTION"
-            )
+        # No usable values remain
+        if invalid_count > 0 and valid_count == 0:
+            return UNSUITABLE
 
-    # Invalid values require attention, but do not automatically
-    # make the dataset unsuitable when valid values remain usable.
-    for column, summary in changes.get(
-        "invalid_values",
-        {}
-    ).items():
+        # Some valid values remain, but invalid values need attention
+        if invalid_count > 0 and valid_count > 0:
+            return ATTENTION
 
-        invalid_count = summary.get(
-            "invalid_count",
-            0
-        )
-
-        valid_count = summary.get(
-            "valid_count",
-            0
-        )
-
-        # Some valid values remain, so the dataset can still be
-        # analyzed after addressing the invalid entries.
-        if (
-            invalid_count > 0
-            and valid_count > 0
-        ):
-
-            return (
-                "NEEDS ATTENTION BEFORE "
-                "ANALYSIS"
-            )
-
-        # No valid values remain in the affected column.
-        if (
-            invalid_count > 0
-            and valid_count == 0
-        ):
-
-            return (
-                "NOT SUITABLE WITHOUT "
-                "ADDITIONAL CORRECTION"
-            )
-
-    # Determine whether removed columns are actually possible renames
+    # 3. Genuine removed columns
     possible_rename_old = {
-        item["old_column"]
-        for item in changes.get(
-            "possible_renames",
-            []
-        )
+        item.get("old_column")
+        for item in changes.get("possible_renames", [])
     }
 
     truly_removed = [
         column
-        for column in changes.get(
-            "removed_columns",
-            []
-        )
+        for column in changes.get("removed_columns", [])
         if column not in possible_rename_old
     ]
 
-    # Genuine removed columns require attention
     if truly_removed:
-        return (
-            "NEEDS ATTENTION BEFORE "
-            "ANALYSIS"
-        )
+        return ATTENTION
 
-    # Significant missing-value increase
-    for change in quality.get(
-        "missing_changes",
-        []
-    ):
+    # 4. Significant missing-value increase
+    if _significant_missing_values(quality, threshold=20):
+        return ATTENTION
 
-        if change["change"] >= 20:
-            return (
-                "NEEDS ATTENTION BEFORE "
-                "ANALYSIS"
-            )
+    # 5. Increased duplicates
+    if quality.get("duplicate_change", 0) > 0:
+        return ATTENTION
 
-    # Increased duplicates
-    if quality.get(
-        "duplicate_change",
-        0
-    ) > 0:
-
-        return (
-            "NEEDS ATTENTION BEFORE "
-            "ANALYSIS"
-        )
-
-    return "READY FOR FURTHER ANALYSIS"
+    # 6. No critical issues
+    return READY
 
 
-def run_intelligence_analysis(
-    old_df,
-    new_df,
-    previous_finding=""
-):
+# ---------------------------------------------------------------------------
+# Main intelligence pipeline
+# ---------------------------------------------------------------------------
+
+def run_intelligence_analysis(old_df, new_df, previous_finding=""):
     """
     Run the complete dataset intelligence workflow.
+
+    Workflow:
+        Detect → Analyze → Compare → Reconsider → Re-plan → Report
     """
-
-    from change_engine import (
-        compare_datasets,
-        compare_statistics
-    )
-
+    from change_engine import compare_datasets, compare_statistics
     from quality_engine import compare_quality
 
-    # 1. Detect changes
-    changes = compare_datasets(
-        old_df,
-        new_df
-    )
+    # ------------------------------------------------------------------
+    # 1. DETECT
+    # ------------------------------------------------------------------
+    changes = compare_datasets(old_df, new_df)
 
-    # 2. Analyze statistics
-    statistics = compare_statistics(
-        old_df,
-        new_df
-    )
+    # ------------------------------------------------------------------
+    # 2. ANALYZE
+    # ------------------------------------------------------------------
+    statistics = compare_statistics(old_df, new_df)
 
-    # 3. Compare data quality
-    quality = compare_quality(
-        old_df,
-        new_df
-    )
+    # ------------------------------------------------------------------
+    # 3. COMPARE
+    # ------------------------------------------------------------------
+    quality = compare_quality(old_df, new_df)
 
-    # 4. Assess impact
     impact = assess_impact(
         changes,
         quality,
         statistics
     )
 
-    # 5. Assess ML readiness
     ml_readiness = assess_ml_readiness(
         changes,
         quality,
         statistics
     )
 
-    # 6. Identify limitations
     limitations = identify_limitations(
         changes,
         quality,
         statistics
     )
 
-    # 7. Reconsider previous findings
-    if previous_finding:
+    # ------------------------------------------------------------------
+    # 4. RECONSIDER
+    # ------------------------------------------------------------------
+    reconsideration = reconsider_previous_finding(
+        previous_finding,
+        changes,
+        quality
+    )
 
-        reconsideration = (
-            reconsider_previous_finding(
-                previous_finding,
-                changes,
-                quality
-            )
-        )
-
-    else:
-
-        reconsideration = {
-            "status": "NO_PREVIOUS_FINDING",
-            "warnings": []
-        }
-
-    # 8. Generate final recommendation
+    # ------------------------------------------------------------------
+    # 5. RE-PLAN
+    # ------------------------------------------------------------------
     recommendation = generate_recommendation(
         changes,
         quality
     )
 
+    # ------------------------------------------------------------------
+    # 6. REPORT
+    # ------------------------------------------------------------------
     return {
         "workflow": [
             "Detect",
