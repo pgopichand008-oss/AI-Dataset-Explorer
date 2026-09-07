@@ -4,37 +4,54 @@ from difflib import SequenceMatcher
 import pandas as pd
 
 
+# ============================================================
+# COLUMN NAME SIMILARITY
+# ============================================================
+
 def _normalize_column_name(name):
-    """Normalize a column name for similarity comparison."""
+    """
+    Normalize a column name for similarity comparison.
+    """
 
-    name = str(name).strip().lower()
+    text = str(name).strip().lower()
 
-    name = re.sub(
+    # Split camelCase names.
+    text = re.sub(
         r"([a-z])([A-Z])",
         r"\1 \2",
-        name
+        text
     )
 
-    name = re.sub(
+    # Replace separators with spaces.
+    text = re.sub(
         r"[^a-z0-9]+",
         " ",
-        name
+        text
     )
 
-    return " ".join(name.split())
+    return " ".join(
+        text.split()
+    )
 
 
 def _name_similarity(old_name, new_name):
     """
-    Calculate similarity between two column names.
+    Calculate column-name similarity.
 
-    Combines:
-    - token similarity
-    - full-text similarity
+    Uses:
+    - token overlap
+    - sequence similarity
+
+    Returns a percentage from 0 to 100.
     """
 
-    old_normalized = _normalize_column_name(old_name)
-    new_normalized = _normalize_column_name(new_name)
+    old_normalized = _normalize_column_name(
+        old_name
+    )
+
+    new_normalized = _normalize_column_name(
+        new_name
+    )
 
     if not old_normalized or not new_normalized:
         return 0.0
@@ -47,71 +64,93 @@ def _name_similarity(old_name, new_name):
         new_normalized.split()
     )
 
-    intersection = len(
-        old_tokens.intersection(new_tokens)
-    )
+    union = old_tokens | new_tokens
 
-    union = len(
-        old_tokens.union(new_tokens)
-    )
+    if union:
+        token_similarity = (
+            len(old_tokens & new_tokens)
+            / len(union)
+        )
+    else:
+        token_similarity = 0.0
 
-    token_score = (
-        intersection / union
-        if union
-        else 0.0
-    )
-
-    text_score = SequenceMatcher(
+    sequence_similarity = SequenceMatcher(
         None,
         old_normalized,
         new_normalized
     ).ratio()
 
-    return (
-        token_score * 0.5
-        + text_score * 0.5
+    return round(
+        (
+            token_similarity * 0.5
+            + sequence_similarity * 0.5
+        ) * 100,
+        1
     )
 
+
+# ============================================================
+# VALUE SIMILARITY
+# ============================================================
 
 def _similar_values(old_series, new_series):
-    """Check whether two columns contain mostly similar values."""
+    """
+    Compare values between two columns.
 
-    old_values = set(
-        old_series
-        .dropna()
+    The comparison is position-based when both columns
+    contain the same number of non-null values.
+
+    Returns a percentage from 0 to 100.
+    """
+
+    old_values = (
+        old_series.dropna()
         .astype(str)
-        .head(1000)
+        .tolist()
     )
 
-    new_values = set(
-        new_series
-        .dropna()
+    new_values = (
+        new_series.dropna()
         .astype(str)
-        .head(1000)
+        .tolist()
     )
 
     if not old_values or not new_values:
         return 0.0
 
-    intersection = len(
-        old_values.intersection(new_values)
+    if len(old_values) != len(new_values):
+        return 0.0
+
+    matches = sum(
+        old == new
+        for old, new in zip(
+            old_values,
+            new_values
+        )
     )
 
-    union = len(
-        old_values.union(new_values)
+    return round(
+        (
+            matches
+            / len(old_values)
+        ) * 100,
+        1
     )
 
-    return (
-        intersection / union
-        if union
-        else 0.0
-    )
 
+# ============================================================
+# TYPE DETECTION
+# ============================================================
 
 def _type_family(series):
     """
-    Classify a pandas Series into a broader
-    data-type family.
+    Classify a pandas Series into a broad type family.
+
+    Families:
+    - numeric
+    - datetime
+    - boolean
+    - text
     """
 
     if pd.api.types.is_bool_dtype(series):
@@ -126,40 +165,55 @@ def _type_family(series):
     return "text"
 
 
-def _type_conflict_level(old_series, new_series):
+def _type_conflict_level(
+    old_series,
+    new_series
+):
     """
-    Determine whether a data-type change represents
-    a meaningful conflict.
+    Determine the severity of a type change.
 
     Returns:
-    - NONE
+    - None
     - LOW
     - HIGH
     """
 
-    old_family = _type_family(old_series)
-    new_family = _type_family(new_series)
+    old_family = _type_family(
+        old_series
+    )
 
+    new_family = _type_family(
+        new_series
+    )
+
+    # Same broad family.
     if old_family == new_family:
 
+        # Different numeric dtypes are generally
+        # manageable and therefore LOW severity.
         if old_family == "numeric":
 
-            old_type = str(
-                old_series.dtype
-            )
-
-            new_type = str(
-                new_series.dtype
-            )
-
-            if old_type != new_type:
+            if (
+                str(old_series.dtype)
+                != str(new_series.dtype)
+            ):
                 return "LOW"
 
-        return "NONE"
+        return None
 
-    # Numeric values becoming text need to be checked
-    # carefully because the new column may contain a
-    # mixture of valid numeric values and invalid text.
+    # --------------------------------------------------------
+    # Numeric -> text
+    # --------------------------------------------------------
+    #
+    # This is the most important mixed-data case.
+    #
+    # Example:
+    # Previous: [21, 24, 30]
+    # Updated:  [21, 24, "Unknown", 30]
+    #
+    # The updated pandas column becomes object/text.
+    # Numeric-looking values remain usable while genuinely
+    # non-numeric values are flagged separately.
     if (
         old_family == "numeric"
         and new_family == "text"
@@ -186,23 +240,23 @@ def _type_conflict_level(old_series, new_series):
             ).sum()
         )
 
-        # No non-numeric values.
-        # The column is effectively still numeric.
+        # All values are still numeric in practice.
         if invalid_count == 0:
             return "LOW"
 
-        # Some valid numeric values remain and only
-        # part of the column contains invalid values.
-        # Valid data can still be used, so classify
-        # this as LOW rather than HIGH.
+        # Some numeric values remain usable.
         if valid_count > 0:
             return "LOW"
 
-        # All non-missing values are invalid/non-numeric.
+        # No usable numeric values remain.
         return "HIGH"
 
-    # Text becoming numeric can be acceptable if the
-    # text column contains values that are consistently numeric.
+    # --------------------------------------------------------
+    # Text -> numeric
+    # --------------------------------------------------------
+    #
+    # If the previous text values are all numeric-looking,
+    # converting them to numeric is normally harmless.
     if (
         old_family == "text"
         and new_family == "numeric"
@@ -227,19 +281,31 @@ def _type_conflict_level(old_series, new_series):
 
         return "HIGH"
 
-    # Any other family change is potentially important.
+    # Any other broad-family change is potentially significant.
     return "HIGH"
 
+
+# ============================================================
+# INVALID VALUE DETECTION
+# ============================================================
 
 def _invalid_value_summary(series):
     """
     Identify values that cannot be interpreted as numeric.
 
-    Valid numeric values are preserved.
-    Invalid values are only reported.
+    This function should ONLY be used when the column is
+    expected to contain numeric data.
+
+    Normal categorical/text columns such as:
+        ["A", "B", "C"]
+
+    are NOT considered invalid.
     """
 
+    # A true numeric pandas Series cannot contain
+    # non-numeric values.
     if pd.api.types.is_numeric_dtype(series):
+
         return {
             "invalid_count": 0,
             "valid_count": int(
@@ -268,16 +334,25 @@ def _invalid_value_summary(series):
         .tolist()
     )
 
+    valid_count = int(
+        (
+            non_missing
+            & converted.notna()
+        ).sum()
+    )
+
     return {
         "invalid_count": int(
             invalid_mask.sum()
         ),
-        "valid_count": int(
-            converted.notna().sum()
-        ),
+        "valid_count": valid_count,
         "invalid_examples": invalid_values
     }
 
+
+# ============================================================
+# DATASET STRUCTURAL COMPARISON
+# ============================================================
 
 def compare_datasets(old_df, new_df):
     """
@@ -288,7 +363,7 @@ def compare_datasets(old_df, new_df):
     - removed columns
     - possible renamed columns
     - data-type conflicts
-    - mixed/invalid values
+    - invalid values in columns that were previously numeric
     """
 
     old_columns = set(
@@ -298,6 +373,10 @@ def compare_datasets(old_df, new_df):
     new_columns = set(
         new_df.columns
     )
+
+    # --------------------------------------------------------
+    # Added / removed columns
+    # --------------------------------------------------------
 
     added_columns = sorted(
         new_columns - old_columns
@@ -312,6 +391,10 @@ def compare_datasets(old_df, new_df):
             new_columns
         )
     )
+
+    # --------------------------------------------------------
+    # Type changes
+    # --------------------------------------------------------
 
     type_changes = []
 
@@ -330,32 +413,25 @@ def compare_datasets(old_df, new_df):
             new_series.dtype
         )
 
-        old_family = _type_family(
-            old_series
-        )
-
-        new_family = _type_family(
-            new_series
-        )
-
-        conflict_level = _type_conflict_level(
+        severity = _type_conflict_level(
             old_series,
             new_series
         )
 
-        if (
-            old_type != new_type
-            or old_family != new_family
-        ):
+        if severity:
 
-            type_changes.append({
-                "column": column,
-                "old_type": old_type,
-                "new_type": new_type,
-                "old_type_family": old_family,
-                "new_type_family": new_family,
-                "conflict_level": conflict_level
-            })
+            type_changes.append(
+                {
+                    "column": column,
+                    "old_type": old_type,
+                    "new_type": new_type,
+                    "severity": severity
+                }
+            )
+
+    # --------------------------------------------------------
+    # Possible rename detection
+    # --------------------------------------------------------
 
     possible_renames = []
 
@@ -363,50 +439,64 @@ def compare_datasets(old_df, new_df):
 
         for new_column in added_columns:
 
+            old_series = old_df[
+                old_column
+            ]
+
+            new_series = new_df[
+                new_column
+            ]
+
+            old_family = _type_family(
+                old_series
+            )
+
+            new_family = _type_family(
+                new_series
+            )
+
+            # Only compare compatible broad families.
+            if old_family != new_family:
+                continue
+
             name_score = _name_similarity(
                 old_column,
                 new_column
             )
 
             value_score = _similar_values(
-                old_df[old_column],
-                new_df[new_column]
+                old_series,
+                new_series
             )
 
-            old_family = _type_family(
-                old_df[old_column]
+            # Name similarity is slightly more important
+            # than value similarity because identical values
+            # alone do not prove that two columns represent
+            # the same concept.
+            confidence = round(
+                (
+                    name_score * 0.6
+                    + value_score * 0.4
+                ),
+                1
             )
 
-            new_family = _type_family(
-                new_df[new_column]
-            )
+            # Conservative threshold.
+            if confidence >= 55:
 
-            if old_family != new_family:
-                continue
+                possible_renames.append(
+                    {
+                        "old_column": old_column,
+                        "new_column": new_column,
+                        "name_similarity": name_score,
+                        "value_similarity": value_score,
+                        "confidence": confidence
+                    }
+                )
 
-            combined_score = (
-                name_score * 0.6
-                + value_score * 0.4
-            )
-
-            if combined_score >= 0.55:
-
-                possible_renames.append({
-                    "old_column": old_column,
-                    "new_column": new_column,
-                    "name_similarity": round(
-                        name_score * 100,
-                        1
-                    ),
-                    "value_similarity": round(
-                        value_score * 100,
-                        1
-                    ),
-                    "confidence": round(
-                        combined_score * 100,
-                        1
-                    )
-                })
+    # --------------------------------------------------------
+    # Invalid-value detection
+    # --------------------------------------------------------
 
     invalid_values = {}
 
@@ -414,8 +504,32 @@ def compare_datasets(old_df, new_df):
         new_df.columns
     ):
 
+        # A newly added column has no previous expectation,
+        # so ordinary text values must not be called invalid.
+        if column not in old_df.columns:
+            continue
+
+        old_series = old_df[column]
+        new_series = new_df[column]
+
+        # Only validate numeric expectations.
+        #
+        # Example:
+        #
+        # Old:
+        # age = [21, 24, 30]
+        #
+        # New:
+        # age = [21, 24, "Unknown", 30]
+        #
+        # "Unknown" should be reported.
+        if not pd.api.types.is_numeric_dtype(
+            old_series
+        ):
+            continue
+
         summary = _invalid_value_summary(
-            new_df[column]
+            new_series
         )
 
         if summary["invalid_count"] > 0:
@@ -431,6 +545,10 @@ def compare_datasets(old_df, new_df):
     }
 
 
+# ============================================================
+# STATISTICAL COMPARISON
+# ============================================================
+
 def compare_statistics(old_df, new_df):
     """
     Compare numerical statistics between previous
@@ -443,8 +561,8 @@ def compare_statistics(old_df, new_df):
     - minimum
     - maximum
 
-    Invalid numerical values are coerced to NaN
-    for calculation, so valid values remain usable.
+    Values that cannot be interpreted as numeric are
+    coerced to NaN so valid observations remain usable.
     """
 
     common_columns = [
@@ -460,144 +578,112 @@ def compare_statistics(old_df, new_df):
         old_series = pd.to_numeric(
             old_df[column],
             errors="coerce"
-        ).dropna()
+        )
 
         new_series = pd.to_numeric(
             new_df[column],
             errors="coerce"
-        ).dropna()
+        )
 
+        old_values = (
+            old_series
+            .dropna()
+        )
+
+        new_values = (
+            new_series
+            .dropna()
+        )
+
+        # Skip columns with no usable numeric data.
         if (
-            old_series.empty
-            or new_series.empty
+            old_values.empty
+            and new_values.empty
         ):
             continue
 
-        old_mean = float(
-            old_series.mean()
-        )
-
-        new_mean = float(
-            new_series.mean()
-        )
-
-        old_median = float(
-            old_series.median()
-        )
-
-        new_median = float(
-            new_series.median()
-        )
-
-        old_std = (
-            float(
-                old_series.std()
+        old_stats = {
+            "mean": (
+                float(old_values.mean())
+                if not old_values.empty
+                else None
+            ),
+            "median": (
+                float(old_values.median())
+                if not old_values.empty
+                else None
+            ),
+            "std": (
+                float(old_values.std())
+                if len(old_values) > 1
+                else 0.0
+            ),
+            "min": (
+                float(old_values.min())
+                if not old_values.empty
+                else None
+            ),
+            "max": (
+                float(old_values.max())
+                if not old_values.empty
+                else None
             )
-            if len(old_series) > 1
-            else 0.0
-        )
+        }
 
-        new_std = (
-            float(
-                new_series.std()
+        new_stats = {
+            "mean": (
+                float(new_values.mean())
+                if not new_values.empty
+                else None
+            ),
+            "median": (
+                float(new_values.median())
+                if not new_values.empty
+                else None
+            ),
+            "std": (
+                float(new_values.std())
+                if len(new_values) > 1
+                else 0.0
+            ),
+            "min": (
+                float(new_values.min())
+                if not new_values.empty
+                else None
+            ),
+            "max": (
+                float(new_values.max())
+                if not new_values.empty
+                else None
             )
-            if len(new_series) > 1
-            else 0.0
+        }
+
+        changes = {}
+
+        for key in old_stats:
+
+            old_value = old_stats[key]
+            new_value = new_stats[key]
+
+            if (
+                old_value is None
+                or new_value is None
+            ):
+                changes[key] = None
+
+            else:
+                changes[key] = round(
+                    new_value - old_value,
+                    4
+                )
+
+        statistical_changes.append(
+            {
+                "column": column,
+                "old": old_stats,
+                "new": new_stats,
+                "changes": changes
+            }
         )
-
-        old_min = float(
-            old_series.min()
-        )
-
-        new_min = float(
-            new_series.min()
-        )
-
-        old_max = float(
-            old_series.max()
-        )
-
-        new_max = float(
-            new_series.max()
-        )
-
-        statistical_changes.append({
-            "column": column,
-
-            "old_mean": round(
-                old_mean,
-                4
-            ),
-
-            "new_mean": round(
-                new_mean,
-                4
-            ),
-
-            "mean_change": round(
-                new_mean - old_mean,
-                4
-            ),
-
-            "old_median": round(
-                old_median,
-                4
-            ),
-
-            "new_median": round(
-                new_median,
-                4
-            ),
-
-            "median_change": round(
-                new_median - old_median,
-                4
-            ),
-
-            "old_std": round(
-                old_std,
-                4
-            ),
-
-            "new_std": round(
-                new_std,
-                4
-            ),
-
-            "std_change": round(
-                new_std - old_std,
-                4
-            ),
-
-            "old_min": round(
-                old_min,
-                4
-            ),
-
-            "new_min": round(
-                new_min,
-                4
-            ),
-
-            "min_change": round(
-                new_min - old_min,
-                4
-            ),
-
-            "old_max": round(
-                old_max,
-                4
-            ),
-
-            "new_max": round(
-                new_max,
-                4
-            ),
-
-            "max_change": round(
-                new_max - old_max,
-                4
-            )
-        })
 
     return statistical_changes
